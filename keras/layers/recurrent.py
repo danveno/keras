@@ -5,12 +5,14 @@ import numpy as np
 from .. import backend as K
 from .. import activations, initializations, regularizers
 from ..engine import Layer, InputSpec
+import theano
 
 
 def time_distributed_dense(x, w, b=None, dropout=None,
                            input_dim=None, output_dim=None, timesteps=None):
     '''Apply y.w + b for every temporal slice y of x.
     '''
+
     if not input_dim:
         # won't work with TensorFlow
         input_dim = K.shape(x)[2]
@@ -34,6 +36,7 @@ def time_distributed_dense(x, w, b=None, dropout=None,
     x = K.dot(x, w)
     if b:
         x = x + b
+
     # reshape to 3D tensor
     x = K.reshape(x, (-1, timesteps, output_dim))
     return x
@@ -155,7 +158,8 @@ class Recurrent(Layer):
     def __init__(self, weights=None,
                  return_sequences=False, go_backwards=False, stateful=False,
                  unroll=False, consume_less='cpu',
-                 input_dim=None, input_length=None, **kwargs):
+                 input_dim=None, input_length=None,
+                 sequence_of_sequences=False, **kwargs):
         self.return_sequences = return_sequences
         self.initial_weights = weights
         self.go_backwards = go_backwards
@@ -167,6 +171,7 @@ class Recurrent(Layer):
         self.input_spec = [InputSpec(ndim=3)]
         self.input_dim = input_dim
         self.input_length = input_length
+        self.sequence_of_sequences = sequence_of_sequences
         if self.input_dim:
             kwargs['input_shape'] = (self.input_length, self.input_dim)
         super(Recurrent, self).__init__(**kwargs)
@@ -175,7 +180,10 @@ class Recurrent(Layer):
         if self.return_sequences:
             return (input_shape[0], input_shape[1], self.output_dim)
         else:
-            return (input_shape[0], self.output_dim)
+            if self.sequence_of_sequences:
+                return (input_shape[0], input_shape[1], self.output_dim)
+            else:
+                return (input_shape[0], self.output_dim)
 
     def compute_mask(self, input, mask):
         if self.return_sequences:
@@ -206,6 +214,30 @@ class Recurrent(Layer):
         # note that the .build() method of subclasses MUST define
         # self.input_spec with a complete input shape.
         input_shape = self.input_spec[0].shape
+
+        #   flatten the whole batch
+        if self.sequence_of_sequences:
+            if self.return_sequences:
+                raise Exception('`return_sequences=True` is currently not '
+                                'supported together with '
+                                '`sequence_of_sequences=True`')
+            if self.stateful:
+                raise Exception('`stateful=True` is currently not '
+                                'supported together with '
+                                '`sequence_of_sequences=True`')
+            if len(input_shape) < 3:
+                raise Exception('When using `return_sequences=True`, '
+                                'you should  define explicitly the number of '
+                                'timesteps of your sequences as well as the '
+                                'batch size.\n'
+                                 'Make sure the first layer has '
+                                '"batch_input_shape" '
+                                'argument, including the time axis. '
+                                'Found input shape at layer ' + self.name +
+                                ': ' + str(input_shape))
+            new_input_shape = (1, input_shape[0]*input_shape[1],input_shape[2])
+            x = K.reshape(x, new_input_shape)
+
         if K._BACKEND == 'tensorflow':
             if not input_shape[1]:
                 raise Exception('When using TensorFlow, you should define '
@@ -224,6 +256,7 @@ class Recurrent(Layer):
         else:
             initial_states = self.get_initial_states(x)
         constants = self.get_constants(x)
+
         preprocessed_input = self.preprocess_input(x)
 
         last_output, outputs, states = K.rnn(self.step, preprocessed_input,
@@ -232,7 +265,14 @@ class Recurrent(Layer):
                                              mask=mask,
                                              constants=constants,
                                              unroll=self.unroll,
-                                             input_length=input_shape[1])
+                                             input_length=None)
+
+        if self.sequence_of_sequences:
+            new_output_shape = (input_shape[0], input_shape[1], self.output_dim)
+            last_output = K.reshape(last_output, new_output_shape)
+            last_output = theano.printing.Print('last_output:')(last_output)
+
+
         if self.stateful:
             self.updates = []
             for i in range(len(states)):
@@ -248,7 +288,8 @@ class Recurrent(Layer):
                   'go_backwards': self.go_backwards,
                   'stateful': self.stateful,
                   'unroll': self.unroll,
-                  'consume_less': self.consume_less}
+                  'consume_less': self.consume_less,
+                  'sequence_of_sequences': self.sequence_of_sequences}
         if self.stateful:
             config['batch_input_shape'] = self.input_spec[0].shape
         else:
